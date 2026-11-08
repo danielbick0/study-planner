@@ -117,7 +117,7 @@ MAX_LEAD_DAYS = 30
 # shows its kind in words, never only as a colour (upgrade 3).
 KIND_HE = {"learn": "למידה", "review": "חזרה", "exercise": "תרגול",
            "simulation": "סימולציה", "break": "הפסקה",
-           "assignment": "שיעורי בית"}
+           "assignment": "שיעורי בית", "busy": "תפוס"}
 
 # One-click sample data (upgrade 7): a clearly marked course, so a
 # friend who gets the project sees a full plan at once instead of
@@ -681,8 +681,13 @@ def _blocks_as_occupied(blocks):
 def reschedule_assignment(conn, assignment_id):
     """(Re)compute one assignment's whole blocks and save them.
 
-    Occupied time = all exam-plan sessions plus the other
-    assignments' blocks, so nothing overlaps. Returns the
+    Occupied time = all exam-plan sessions EXCEPT not-done review
+    sessions, plus the other assignments' blocks. A review session
+    that is not done yet is filler — homework outranks it, so it
+    yields its time to the assignment, and the exam plan is rebuilt
+    afterwards (see reschedule_everything) so the review moves into
+    whatever free time is left, or is honestly skipped. Done
+    reviews stay occupied: done work is done. Returns the
     schedule_assignment result (blocks + unscheduled minutes).
     """
     row = conn.execute(
@@ -696,7 +701,9 @@ def reschedule_assignment(conn, assignment_id):
     occupied = [
         {"session_date": s["session_date"], "start_time": s["start_time"],
          "end_time": s["end_time"]}
-        for s in conn.execute("SELECT * FROM plan_sessions").fetchall()
+        for s in conn.execute(
+            "SELECT * FROM plan_sessions"
+            " WHERE kind != 'review' OR done = 1").fetchall()
     ]
     occupied += _blocks_as_occupied([
         b for b in get_all_assignment_blocks(conn)
@@ -733,18 +740,30 @@ def regenerate_all_exam_plans(conn):
         regenerate_exam_plan(conn, row["id"])
 
 
+def regenerate_existing_plans(conn):
+    """Rebuild every exam that already has a plan, earliest exam
+    first — the second half of the cascade (see
+    reschedule_everything): after assignments move, the plans
+    reflow into the time that is left, so a review that yielded
+    its slot to homework lands elsewhere or is honestly skipped."""
+    for exam_id in exams_with_plans(conn):
+        regenerate_exam_plan(conn, exam_id)
+
+
 def reschedule_everything(conn):
     """Reschedule every still-open assignment and regenerate every
     exam that has a plan — the cascade that runs whenever time
     frees up or gets blocked (an assignment marked done, a busy
     block added, an exam or assignment deleted). Open assignments
-    are rescheduled first, then exams, so freed time is reused
-    right away instead of sitting empty."""
+    are rescheduled first, in due-date order (the most urgent
+    first — a sooner-due assignment created later still outranks
+    a later-due one created earlier), then exams, so freed time
+    is reused right away instead of sitting empty."""
     for row in conn.execute(
-            "SELECT id FROM assignments WHERE done = 0"):
+            "SELECT id FROM assignments WHERE done = 0"
+            " ORDER BY (due_date IS NULL), due_date, id"):
         reschedule_assignment(conn, row["id"])
-    for exam_id in exams_with_plans(conn):
-        regenerate_exam_plan(conn, exam_id)
+    regenerate_existing_plans(conn)
 
 
 def mark_assignment_done(conn, assignment_id):
@@ -769,11 +788,15 @@ def mark_assignment_undone(conn, assignment_id):
     are scheduled again, fitting around the other work (the same
     reschedule used everywhere else). If the due date has passed by
     now, no block fits and the assignment honestly reports its
-    minutes as unscheduled instead of silently dropping them."""
+    minutes as unscheduled instead of silently dropping them. The
+    exam plans are rebuilt afterwards, so a review that has to
+    yield its slot to the reopened assignment moves elsewhere."""
     conn.execute(
         "UPDATE assignments SET done = 0 WHERE id = ?", (assignment_id,)
     )
-    return reschedule_assignment(conn, assignment_id)
+    result = reschedule_assignment(conn, assignment_id)
+    regenerate_existing_plans(conn)
+    return result
 
 
 def mark_session_undone(conn, session_id):
@@ -1895,15 +1918,20 @@ def todays_items(items, day=None):
 
 
 def annotate_today_items(items, now_minutes):
-    """Mark today's items with "now" and "next", by the clock.
+    """Mark today's items with "now", "missed" and "next", by the clock.
 
-    The item happening right now (not done yet) gets "עכשיו"; the
-    first not-yet-started, not-done item after now gets "הבא בתור".
-    Two separate flags — the old code used one flag for both, so
-    once "עכשיו" was used, "הבא" never appeared at all. A done
-    item is never "now" or "next": it is already finished.
-    Pure function, easy to test with a fixed clock (QA fix 9).
-    Returns the items with "marker" and "marker_class" added."""
+    The item happening right now (not done yet) gets "עכשיו"; an
+    item whose time already ended today and is still not done gets
+    "⏰ פספסת" — missed work is flagged the same day, not only
+    from tomorrow; the first not-yet-started, not-done item after
+    now gets "הבא בתור". Three separate flags — the old code used
+    one flag for both "now" and "next", so once "עכשיו" was used,
+    "הבא" never appeared at all. A done item is never "now",
+    "missed" or "next": it is already finished. Breaks are not
+    work and are never missed; busy blocks are blocked time, not
+    work either. Pure function, easy to test with a fixed clock
+    (QA fix 9). Returns the items with "marker" and
+    "marker_class" added."""
     now_used = False
     next_used = False
     annotated = []
@@ -1924,6 +1952,11 @@ def annotate_today_items(items, now_minutes):
             marker = " 🔵 עכשיו"
             marker_class = " now"
             now_used = True
+        elif (not _item_done(item)
+              and item.get("kind") not in ("break", "busy")
+              and end <= now_minutes):
+            marker = " ⏰ פספסת"
+            marker_class = " missed"
         elif (not _item_done(item) and not next_used
               and start > now_minutes):
             marker = " ➡️ הבא בתור"
@@ -2222,7 +2255,18 @@ def collect_plan_events(conn, exam_id=None):
     """The plan as calendar events (upgrade 8): plan sessions
     and assignment blocks that are not done yet — done work needs
     no reminder. With an exam id, only that exam's sessions;
-    without one, the whole plan, assignments included."""
+    without one, the whole plan, assignments included. The exam
+    itself is an all-day event on its date, and busy blocks are
+    events too — otherwise the imported calendar shows when to
+    study but not when the exam is, and blocked time looks free."""
+    # The id arrives as text from the URL ("/export-exam.ics?
+    # exam_id=3") but as an int from code — normalise it, so the
+    # per-exam export actually matches its own exam.
+    if exam_id is not None:
+        try:
+            exam_id = int(exam_id)
+        except (TypeError, ValueError):
+            pass
     events = []
     if exam_id is None:
         rows = conn.execute(
@@ -2266,6 +2310,34 @@ def collect_plan_events(conn, exam_id=None):
                 "summary": f"שיעורי בית: {b['assignment_title']}"
                            f" — {b['part_label']}",
             })
+        # Busy blocks, today onwards: blocked time is visible in
+        # the imported calendar too, with its reason.
+        for b in conn.execute(
+                "SELECT * FROM busy_blocks WHERE block_date >= ?"
+                " ORDER BY block_date, start_time",
+                (date.today().isoformat(),)).fetchall():
+            events.append({
+                "uid": f"busy-{b['id']}@study-planner",
+                "date": b["block_date"], "start": b["start_time"],
+                "end": b["end_time"],
+                "summary": (f"תפוס: {b['reason']}"
+                            if b["reason"] else "תפוס"),
+            })
+    # The exam itself, as an all-day event on its date — no
+    # invented hour, just the day. Past exams are left out.
+    for e in get_exams(conn):
+        if exam_id is not None and e["id"] != exam_id:
+            continue
+        if not e["exam_date"]:
+            continue
+        if e["exam_date"] < date.today().isoformat():
+            continue
+        kind_he = "בוחן" if e["kind"] == "quiz" else "מבחן"
+        events.append({
+            "uid": f"exam-{e['id']}@study-planner",
+            "date": e["exam_date"], "all_day": True,
+            "summary": f"{kind_he}: {e['title']} — {e['course_name']}",
+        })
     return events
 
 
@@ -2273,12 +2345,27 @@ def build_ics(events):
     """The events as a valid .ics file (upgrade 8): plain text,
     standard library only, no network, no passwords. Every event
     carries UID, DTSTAMP, DTSTART, DTEND and SUMMARY, so Google
-    and Apple Calendar both import it."""
+    and Apple Calendar both import it. An all-day event (the exam
+    itself) uses VALUE=DATE with the next day as DTEND — the
+    standard way to say "this whole day"."""
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     lines = ["BEGIN:VCALENDAR", "VERSION:2.0",
              "PRODID:-//Study Planner//HE",
              "CALSCALE:GREGORIAN", "METHOD:PUBLISH"]
     for event in events:
+        if event.get("all_day"):
+            day = event["date"]
+            if isinstance(day, str):
+                day = date.fromisoformat(day)
+            nxt = day + timedelta(days=1)
+            lines += ["BEGIN:VEVENT",
+                      f"UID:{ics_escape(event['uid'])}",
+                      f"DTSTAMP:{stamp}",
+                      "DTSTART;VALUE=DATE:" + day.strftime("%Y%m%d"),
+                      "DTEND;VALUE=DATE:" + nxt.strftime("%Y%m%d"),
+                      f"SUMMARY:{ics_escape(event['summary'])}",
+                      "END:VEVENT"]
+            continue
         lines += ["BEGIN:VEVENT",
                   f"UID:{ics_escape(event['uid'])}",
                   f"DTSTAMP:{stamp}",
@@ -2629,8 +2716,10 @@ ul{padding-inline-start:1.2em} li{margin:.45em 0}
 .session.simulation{border-color:#7c4a6e;background:#f6ecf3}
 .session.break{border-color:#9a9a8a;background:#f2f2ee;color:var(--muted)}
 .session.assignment{border-color:#b45309;background:#fdf0dd}
+.session.busy{border-color:#9a9a8a;background:#f2f2ee;color:var(--muted)}
 .session.now{outline:2px solid var(--green);font-weight:600}
 .session.next{background:#e6f2e9}
+.session.missed{background:var(--red-bg);border-color:var(--red)}
 .tl-item{display:grid;grid-template-columns:6.5em 1fr;gap:.6em;align-items:start}
 .tl-time{font-weight:700;white-space:nowrap}
 .tl-kind{display:inline-block;font-size:.85rem;font-weight:700;border:1px solid var(--border);
@@ -2666,7 +2755,9 @@ padding:.1em .7em;font-size:.9rem;font-weight:700;margin-inline-end:.4em}
 .session.simulation{background:#382a33;border-color:#c27ba8}
 .session.break{background:#2a2d28}
 .session.assignment{background:#3a2c1c;border-color:#d99a4a}
+.session.busy{background:#2a2d28}
 .session.next{background:#22382a}
+.session.missed{background:#3a2323;border-color:#f0a8a8}
 .session{background:#2a2d28}
 .topnav a:hover{background:#22382a}
 .progress{background:#3c423a}
@@ -2960,7 +3051,7 @@ def collect_page_data(courses, assignments, topics=None,
     # it, a compact peek at the coming days.
     KIND_HE = {"learn": "למידה", "review": "חזרה", "exercise": "תרגול",
                "simulation": "סימולציה", "break": "הפסקה",
-               "assignment": "שיעורי בית"}
+               "assignment": "שיעורי בית", "busy": "תפוס"}
     assignment_titles = {a["id"]: a["title"] for a in assignments}
     assignment_done = {a["id"]: bool(a["done"]) for a in assignments}
     all_items = []
@@ -2987,10 +3078,24 @@ def collect_page_data(courses, assignments, topics=None,
                 "done": assignment_done.get(assignment_id, False),
                 "exam_title": "", "assignment_id": assignment_id,
             })
+    # Blocked time shows in the calendar too: otherwise the day
+    # looks free and empty, with no sign of why nothing was
+    # planned there. "done" here only means "not work" — a busy
+    # block is never ticked, never missed, and never counted in
+    # today's done/total.
+    for b in busy_blocks:
+        all_items.append({
+            "date": b["block_date"], "start_time": b["start_time"],
+            "end_time": b["end_time"], "kind": "busy",
+            "label": (f"תפוס: {b['reason']}" if b["reason"] else "תפוס"),
+            "done": True,
+            "exam_title": "",
+        })
 
     today_date = date.today()
     today_items = todays_items(all_items, today_date)
-    today_done = sum(1 for item in today_items if item["done"])
+    today_done = sum(1 for item in today_items
+                     if item["done"] and item["kind"] != "busy")
     now_minutes = datetime.now().hour * 60 + datetime.now().minute
     # "next" sends a done-tick back here (URL-encoded, so the
     # anchor survives as part of the redirect target). It carries
@@ -3036,7 +3141,8 @@ def collect_page_data(courses, assignments, topics=None,
             f"{esc(item['end_time'])}</div>"
             f'<div class="tl-body"><span class="tl-kind">'
             f"{esc(kind_text)}</span> "
-            + ("✅ " if item["done"] else "⬜ ")
+            + ("" if item["kind"] == "busy"
+               else ("✅ " if item["done"] else "⬜ "))
             + f"<b>{esc(label_text)}</b>{marker}"
             + (f" ({esc(item['exam_title'])})" if item["exam_title"] else "")
             + done_link
@@ -3087,7 +3193,8 @@ def collect_page_data(courses, assignments, topics=None,
         f"<ul class=\"timeline\">{missed_rows}</ul>"
         if missed_rows else ""
     )
-    today_total = len(today_items)
+    today_total = sum(1 for item in today_items
+                      if item["kind"] != "busy")
     today_pct = round(100 * today_done / today_total) if today_total else 0
     today_section = (
         f"<h2>מה עושים היום</h2>"
@@ -3678,8 +3785,9 @@ def _dashboard_assignments_html(d):
 def dashboard_page(d, error=None, saved=False, warn=""):
     """The home page: a daily dashboard only. Today first, then the
     rest of the week condensed, then a compact look at exams and
-    assignments. No settings forms live here any more — each one has
-    its own page, linked from the slim nav."""
+    assignments — with a quick add-assignment form, because
+    homework is daily. Every other settings form has its own
+    page, linked from the slim nav."""
     prefs = d["prefs"]
     routine_missing = not (
         prefs and prefs["session_minutes"]
@@ -3709,10 +3817,45 @@ def dashboard_page(d, error=None, saved=False, warn=""):
 <p><a class="done-btn" href="/add-exam">＋ הוסף מבחן / בוחן</a> · <a href="/exams">כל המבחנים ←</a></p></section>
 <section class="card-quiet" id="assignments-peek"><h2>מטלות פתוחות</h2>
 {_dashboard_assignments_html(d)}
+{quick_add_assignment_html(d)}
 <p><a href="/assignments">כל המטלות ←</a></p></section>
 <p><a href="/setup">🧭 אשף ההתחלה</a> · <a href="/export-plan.ics">הורד את כל התוכנית כקובץ יומן (.ics)</a></p>
 """
     return shell_html("היום", body, active="/")
+
+
+def quick_add_assignment_html(d):
+    """A compact add-assignment form right on the dashboard:
+    homework is a daily thing — adding one should not need a
+    trip to another page, the way adding an exam (once a
+    semester) can. Same fields and same server-side validation
+    as the full form on /assignments; on save it comes back
+    here with "נשמר ✓" (hidden next=/?saved=1). Hidden when
+    there are no courses yet — an empty course select used to
+    crash the request (QA round 2, fix 3)."""
+    if not d["courses"]:
+        return ('<p>אין קורסים עדיין — '
+                '<a href="/courses">הוסף קורס קודם</a>, ורק אז אפשר '
+                'להוסיף מטלות.</p>')
+    return (
+        '<form method="post" action="/add-assignment">'
+        '<input type="hidden" name="next" value="/?saved=1">'
+        '<label>מטלה חדשה '
+        '<input name="title" required></label> '
+        '<label>קורס '
+        f'<select name="course_id">{d["course_options"]}</select>'
+        '</label> '
+        '<label>הגשה '
+        f'<input type="date" name="due_date" value="{d["assignment_default"]}">'
+        '</label> '
+        '<label>שעות '
+        '<input name="estimated_hours" inputmode="decimal" size="4">'
+        '</label> '
+        '<label>חלקים '
+        '<input name="num_parts" value="1" size="3">'
+        '</label> '
+        '<button type="submit">הוסף מטלה</button></form>'
+    )
 
 
 def section_page(d, section, error=None, saved=False, warn="",
@@ -5152,7 +5295,10 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/schedule-assignment":
             assignment_id = parse_qs(parsed.query).get("id", [""])[0]
             with connect() as conn:
-                reschedule_assignment(conn, assignment_id)
+                # Full cascade: the assignment is rescheduled in
+                # due-date order with the rest, then the exam plans
+                # are rebuilt around it.
+                reschedule_everything(conn)
             self._redirect_home("assignments")
             return
         if parsed.path == "/topic-done":
@@ -5613,8 +5759,12 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 # Schedule its whole blocks right away, so the new
                 # assignment never shows "0 minutes scheduled" until
-                # the user presses something.
-                reschedule_assignment(conn, cursor.lastrowid)
+                # the user presses something. The full cascade runs:
+                # every open assignment is rescheduled in due-date
+                # order, then the exam plans are rebuilt — a review
+                # that has to yield its slot to the new assignment
+                # moves into the time that is left.
+                reschedule_everything(conn)
             elif self.path == "/add-topic":
                 # QA round 3, fix 2: an empty title used to fall
                 # through to the generic redirect and show

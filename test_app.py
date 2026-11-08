@@ -1458,9 +1458,15 @@ class QAFixTest(unittest.TestCase):
         marked = app.annotate_today_items(items, 9 * 60 + 30)
         self.assertEqual(marked[0]["marker"], "")
         self.assertEqual(marked[1]["marker"], " ➡️ הבא בתור")
-        # After everything: no markers at all.
+        # After everything: the done item has no marker; the two
+        # not-done items that already ended are flagged missed
+        # the same day (deepening round: "פספסת" already today,
+        # not only from tomorrow).
         marked = app.annotate_today_items(items, 23 * 60)
-        self.assertTrue(all(m["marker"] == "" for m in marked))
+        self.assertEqual(marked[0]["marker"], "")
+        self.assertEqual(marked[1]["marker"], " ⏰ פספסת")
+        self.assertEqual(marked[2]["marker"], " ⏰ פספסת")
+        self.assertEqual(marked[1]["marker_class"], " missed")
 
     def test_today_page_shows_now_marker(self):
         # An all-day item always covers "now", so the page shows
@@ -3126,6 +3132,17 @@ class UndoTest(unittest.TestCase):
                 " VALUES (?, '09:00', '12:00')", (today.weekday(),))
         topic_id = self._add_topics(calc_id, "Limits")[0]
         exam_id = self._add_exam(calc_id)
+        with app.connect() as conn:
+            # A single 3-hour window with the default 40% learn
+            # share leaves a 48-minute learn bucket — too small
+            # for one 50-minute session — so a rebuilt plan would
+            # honestly leave the topic unscheduled. Give the exam
+            # a 100% learn share, so the rebuilt plan can still
+            # place the learning session after the undos.
+            conn.execute(
+                "UPDATE exams SET learn_pct = 100, review_pct = 0,"
+                " exercise_pct = 0, simulation_pct = 0 WHERE id = ?",
+                (exam_id,))
         session_id = self._add_session(exam_id, topic_id, today)
         assignment_id = self._add_assignment(calc_id, days=0)
         with app.connect() as conn:
@@ -3153,9 +3170,16 @@ class UndoTest(unittest.TestCase):
         _, _, data = self._request("GET", "/topics")
         self.assertIn("סמן כנלמד", data)
         with app.connect() as conn:
-            done = conn.execute(
-                "SELECT done FROM plan_sessions WHERE id = ?",
-                (session_id,)).fetchone()["done"]
+            # Undoing the assignment rebuilds the exam plan, so
+            # the manually added session row is replaced by a
+            # generated one — look the session up by its exam and
+            # topic, not by the old row id.
+            session = conn.execute(
+                "SELECT done FROM plan_sessions WHERE exam_id = ?"
+                " AND kind = 'learn'",
+                (exam_id,)).fetchone()
+            self.assertIsNotNone(session)
+            done = session["done"]
             learned = conn.execute(
                 "SELECT learned FROM topics WHERE id = ?", (topic_id,)
             ).fetchone()["learned"]
@@ -3950,9 +3974,14 @@ class UpgradesTest(unittest.TestCase):
         events = data.split("BEGIN:VEVENT")[1:]
         self.assertGreater(len(events), 0)
         for event in events:
-            for field in ("UID:", "DTSTAMP:", "DTSTART:",
-                          "DTEND:", "SUMMARY:"):
+            for field in ("UID:", "DTSTAMP:", "SUMMARY:"):
                 self.assertIn(field, event)
+            # Timed events carry DTSTART:/DTEND:; the exam itself
+            # is an all-day event (DTSTART;VALUE=DATE:).
+            self.assertTrue(
+                "DTSTART:" in event or "DTSTART;VALUE=DATE:" in event)
+            self.assertTrue(
+                "DTEND:" in event or "DTEND;VALUE=DATE:" in event)
         return events
 
     def test_ics_export_whole_plan(self):
@@ -4637,14 +4666,18 @@ class RedesignTest(unittest.TestCase):
                         data.index('id="future"'))
         self.assertLess(data.index('id="future"'),
                         data.index('id="exams-peek"'))
-        # No settings section lives on the dashboard any more.
+        # No settings section lives on the dashboard any more —
+        # except the quick add-assignment form, which is there on
+        # purpose (deepening round: homework is daily).
         for marker in ('id="routine"', 'id="courses"', 'id="slots"',
                        'id="exams"', 'id="topics"', 'id="busy"',
                        'id="assignments"'):
             self.assertNotIn(marker, data)
         for field in ('name="session_minutes"', 'name="syllabus"',
-                      'name="estimated_hours"', 'name="lead_days"'):
+                      'name="lead_days"'):
             self.assertNotIn(field, data)
+        self.assertIn('action="/add-assignment"', data)
+        self.assertIn('name="estimated_hours"', data)
         # The slim nav links to the five pages.
         for href in ('href="/"', 'href="/exams"', 'href="/courses"',
                      'href="/slots"', 'href="/routine"'):
@@ -5272,6 +5305,354 @@ class TopicEditTest(unittest.TestCase):
                 conn.execute(
                     "SELECT importance FROM topics WHERE id = ?",
                     (topic_ids[0],)).fetchone()[0], "high")
+
+
+class DeepeningTest(unittest.TestCase):
+    """Deepening round (2026-11-08): assignments outrank general
+    reviews, a quick add-assignment form on the dashboard, busy
+    blocks and the exam itself visible in the calendar and the
+    .ics export, same-day missed marking, and assignments
+    scheduled in due-date order.
+
+    Live HTTP checks run against a server on a temp DB, like
+    ServerTest, so the 200/303 statuses and Location headers are
+    the real ones."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        app.DB_PATH = os.path.join(self.tmp.name, "test.db")
+        app.init_db()
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), app.Handler)
+        self.port = self.server.server_address[1]
+        self.thread = threading.Thread(
+            target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.tmp.cleanup()
+
+    def _request(self, method, path, fields=None):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port)
+        body = urlencode(fields or {}, doseq=True) if fields else None
+        headers = {"Content-Type": "application/x-www-form-urlencoded"} \
+            if body else {}
+        conn.request(method, path, body=body, headers=headers)
+        resp = conn.getresponse()
+        data = resp.read().decode()
+        location = resp.getheader("Location")
+        status = resp.status
+        conn.close()
+        return status, location, data
+
+    def _course_id(self, name="Calculus 2"):
+        with app.connect() as conn:
+            return conn.execute(
+                "SELECT id FROM courses WHERE name = ?", (name,)
+            ).fetchone()["id"]
+
+    def _add_topics(self, course_id, *titles):
+        with app.connect() as conn:
+            ids = []
+            for title in titles:
+                cursor = conn.execute(
+                    "INSERT INTO topics (course_id, title) VALUES (?, ?)",
+                    (course_id, title),
+                )
+                ids.append(cursor.lastrowid)
+            return ids
+
+    def _add_scarce_slots(self, start="10:00", end="12:00"):
+        """Two hours of free time a day — scarce enough that an
+        exam plan fills every window and a new assignment has to
+        fight for time."""
+        with app.connect() as conn:
+            conn.execute(
+                "INSERT INTO free_slots (weekday, start_time, end_time)"
+                " VALUES (?, ?, ?), (?, ?, ?), (?, ?, ?), (?, ?, ?),"
+                " (?, ?, ?), (?, ?, ?), (?, ?, ?)",
+                tuple(v for d in range(7) for v in (d, start, end)))
+
+    def _scarce_setup(self):
+        """Exam in 10 days over 6 topics, 40/20/20/20, on scarce
+        slots — the plan fills the windows with learning, review,
+        exercise and a simulation."""
+        course_id = self._course_id()
+        self._add_topics(course_id, "Topic 1", "Topic 2", "Topic 3",
+                         "Topic 4", "Topic 5", "Topic 6")
+        self._add_scarce_slots()
+        with app.connect() as conn:
+            cursor = conn.execute(
+                "INSERT INTO exams (course_id, kind, title, exam_date,"
+                " learn_pct, review_pct, exercise_pct, simulation_pct,"
+                " lead_days) VALUES (?, 'exam', 'Midterm', ?,"
+                " 40, 20, 20, 20, 14)",
+                (course_id,
+                 (date.today() + timedelta(days=10)).isoformat()),
+            )
+            exam_id = cursor.lastrowid
+            app.regenerate_exam_plan(conn, exam_id)
+            return course_id, exam_id
+
+    def _overlaps(self, conn):
+        """Overlapping (assignment block, plan session) pairs — the
+        calendar must never show two things at the same time."""
+        blocks = conn.execute(
+            "SELECT block_date, start_time, end_time"
+            " FROM assignment_blocks").fetchall()
+        sessions = conn.execute(
+            "SELECT session_date, start_time, end_time"
+            " FROM plan_sessions").fetchall()
+
+        def mins(text):
+            hours, minutes = text.split(":")
+            return int(hours) * 60 + int(minutes)
+
+        pairs = 0
+        for b in blocks:
+            for s in sessions:
+                if (b["block_date"] == s["session_date"]
+                        and mins(b["start_time"]) < mins(s["end_time"])
+                        and mins(s["start_time"]) < mins(b["end_time"])):
+                    pairs += 1
+        return pairs
+
+    # --- 1: assignments outrank general reviews -------------------
+
+    def test_assignment_outranks_reviews(self):
+        course_id, exam_id = self._scarce_setup()
+        with app.connect() as conn:
+            reviews_before = conn.execute(
+                "SELECT COUNT(*) FROM plan_sessions"
+                " WHERE kind = 'review'").fetchone()[0]
+            self.assertEqual(reviews_before, 8)
+            cursor = conn.execute(
+                "INSERT INTO assignments (course_id, title, due_date,"
+                " estimated_hours, num_parts, done)"
+                " VALUES (?, 'HW 5', ?, 3, 1, 0)",
+                (course_id,
+                 (date.today() + timedelta(days=4)).isoformat()),
+            )
+            assignment_id = cursor.lastrowid
+            app.reschedule_everything(conn)
+            result = app.assignment_schedule_summary(
+                dict(conn.execute(
+                    "SELECT * FROM assignments WHERE id = ?",
+                    (assignment_id,)).fetchone()),
+                app.get_assignment_blocks(conn, assignment_id))
+            # Before the fix the assignment got 50 of 180 minutes,
+            # as ten-minute crumbs, while reviews kept their slots.
+            self.assertGreaterEqual(result[1], 150)
+            self.assertLessEqual(result[2], 30)
+            reviews_after = conn.execute(
+                "SELECT COUNT(*) FROM plan_sessions"
+                " WHERE kind = 'review'").fetchone()[0]
+            self.assertLess(reviews_after, reviews_before)
+            # Learning is untouched: the assignment took time from
+            # reviews, not from learning new material.
+            self.assertEqual(
+                conn.execute(
+                    "SELECT COUNT(*) FROM plan_sessions"
+                    " WHERE kind = 'learn'").fetchone()[0], 6)
+            self.assertEqual(self._overlaps(conn), 0)
+
+    def test_add_assignment_route_regenerates_exam_plan(self):
+        course_id, exam_id = self._scarce_setup()
+        status, location, _ = self._request("POST", "/add-assignment", {
+            "course_id": str(course_id), "title": "HW 5",
+            "due_date": (date.today() + timedelta(days=4)).isoformat(),
+            "estimated_hours": "3", "num_parts": "1"})
+        self.assertEqual(status, 303)
+        self.assertEqual(location, "/?open=assignments&saved=1#assignments")
+        with app.connect() as conn:
+            # The displaced reviews moved — nothing overlaps the
+            # new assignment blocks.
+            self.assertEqual(self._overlaps(conn), 0)
+            blocks = conn.execute(
+                "SELECT COUNT(*) FROM assignment_blocks").fetchone()[0]
+            self.assertGreater(blocks, 0)
+
+    def test_undone_assignment_regenerates_plans(self):
+        course_id, exam_id = self._scarce_setup()
+        with app.connect() as conn:
+            cursor = conn.execute(
+                "INSERT INTO assignments (course_id, title, due_date,"
+                " estimated_hours, num_parts, done)"
+                " VALUES (?, 'HW 5', ?, 3, 1, 0)",
+                (course_id,
+                 (date.today() + timedelta(days=4)).isoformat()),
+            )
+            assignment_id = cursor.lastrowid
+            app.reschedule_everything(conn)
+            app.mark_assignment_done(conn, assignment_id)
+            self.assertEqual(
+                len(app.get_assignment_blocks(conn, assignment_id)), 0)
+            app.mark_assignment_undone(conn, assignment_id)
+            self.assertGreater(
+                len(app.get_assignment_blocks(conn, assignment_id)), 0)
+            self.assertEqual(self._overlaps(conn), 0)
+
+    # --- 6: assignments scheduled in due-date order ---------------
+
+    def test_assignments_scheduled_by_due_date(self):
+        course_id = self._course_id()
+        self._add_scarce_slots("09:00", "10:30")
+        # Two 6-hour assignments, 7 days x 90 minutes = 630 free
+        # minutes between them. The later-due one is created
+        # first; the sooner-due one must still win the time
+        # before its deadline.
+        with app.connect() as conn:
+            conn.execute(
+                "INSERT INTO assignments (course_id, title, due_date,"
+                " estimated_hours, num_parts, done)"
+                " VALUES (?, 'Later', ?, 6, 1, 0)",
+                (course_id,
+                 (date.today() + timedelta(days=6)).isoformat()),
+            )
+            conn.execute(
+                "INSERT INTO assignments (course_id, title, due_date,"
+                " estimated_hours, num_parts, done)"
+                " VALUES (?, 'Sooner', ?, 6, 1, 0)",
+                (course_id,
+                 (date.today() + timedelta(days=2)).isoformat()),
+            )
+            app.reschedule_everything(conn)
+            sooner = conn.execute(
+                "SELECT * FROM assignments WHERE title = 'Sooner'"
+            ).fetchone()
+            blocks = app.get_assignment_blocks(conn, sooner["id"])
+            scheduled = sum(
+                app._to_minutes(b["end_time"])
+                - app._to_minutes(b["start_time"]) for b in blocks)
+            # All 270 minutes before its deadline go to the sooner
+            # assignment; in creation order it would have got 0.
+            self.assertEqual(scheduled, 270)
+
+    # --- 5: same-day missed marking -------------------------------
+
+    def test_today_missed_marker(self):
+        items = [
+            {"start_time": "09:00", "end_time": "09:50",
+             "kind": "learn", "done": False},
+            {"start_time": "10:00", "end_time": "10:50",
+             "kind": "learn", "done": False},
+            {"start_time": "10:50", "end_time": "11:00",
+             "kind": "break", "done": False},
+            {"start_time": "13:00", "end_time": "13:50",
+             "kind": "learn", "done": False},
+            {"start_time": "14:00", "end_time": "14:50",
+             "kind": "learn", "done": False},
+        ]
+        annotated = app.annotate_today_items(items, 13 * 60 + 26)
+        self.assertEqual(annotated[0]["marker"], " ⏰ פספסת")
+        self.assertEqual(annotated[0]["marker_class"], " missed")
+        self.assertEqual(annotated[1]["marker"], " ⏰ פספסת")
+        # A break is not work: never missed.
+        self.assertEqual(annotated[2]["marker"], "")
+        # The item happening now is still "now", not missed.
+        self.assertEqual(annotated[3]["marker"], " 🔵 עכשיו")
+        # The next item is still "next".
+        self.assertEqual(annotated[4]["marker"], " ➡️ הבא בתור")
+
+    def test_today_missed_marker_skips_done_items(self):
+        items = [
+            {"start_time": "09:00", "end_time": "09:50",
+             "kind": "learn", "done": True},
+        ]
+        annotated = app.annotate_today_items(items, 13 * 60 + 26)
+        self.assertEqual(annotated[0]["marker"], "")
+
+    # --- 2: quick add-assignment form on the dashboard ------------
+
+    def test_dashboard_has_quick_add_assignment_form(self):
+        status, _, data = self._request("GET", "/")
+        self.assertEqual(status, 200)
+        self.assertIn('action="/add-assignment"', data)
+        self.assertIn('name="next" value="/?saved=1"', data)
+        self.assertIn('מטלה חדשה', data)
+
+    def test_quick_add_assignment_returns_to_dashboard(self):
+        course_id = self._course_id()
+        status, location, _ = self._request("POST", "/add-assignment", {
+            "course_id": str(course_id), "title": "HW quick",
+            "due_date": (date.today() + timedelta(days=7)).isoformat(),
+            "estimated_hours": "2", "num_parts": "1",
+            "next": "/?saved=1"})
+        self.assertEqual(status, 303)
+        self.assertEqual(location, "/?saved=1")
+        _, _, data = self._request("GET", location)
+        self.assertIn("נשמר ✓", data)
+        self.assertIn("HW quick", data)
+
+    # --- 3: busy blocks visible in the calendar -------------------
+
+    def test_busy_block_shows_in_calendar(self):
+        course_id = self._course_id()
+        self._add_scarce_slots()
+        with app.connect() as conn:
+            conn.execute(
+                "INSERT INTO busy_blocks (block_date, start_time,"
+                " end_time, reason) VALUES (?, '18:00', '20:00',"
+                " 'חברים')",
+                ((date.today() + timedelta(days=1)).isoformat(),))
+        _, _, data = self._request("GET", "/")
+        self.assertIn("חברים", data)
+        self.assertIn("תפוס", data)
+
+    def test_busy_block_today_does_not_count_as_work(self):
+        with app.connect() as conn:
+            conn.execute(
+                "INSERT INTO busy_blocks (block_date, start_time,"
+                " end_time, reason) VALUES (?, '18:00', '20:00',"
+                " 'חברים')",
+                (date.today().isoformat(),))
+        _, _, data = self._request("GET", "/")
+        self.assertIn("חברים", data)
+        # No work is planned today, so the count is 0 of 0 — the
+        # busy block is blocked time, not a task.
+        self.assertIn("הושלמו היום 0 מתוך 0", data)
+
+    def test_busy_block_yesterday_is_never_missed(self):
+        with app.connect() as conn:
+            conn.execute(
+                "INSERT INTO busy_blocks (block_date, start_time,"
+                " end_time, reason) VALUES (?, '18:00', '20:00',"
+                " 'חברים')",
+                ((date.today() - timedelta(days=1)).isoformat(),))
+        _, _, data = self._request("GET", "/")
+        self.assertNotIn("פספסת", data)
+
+    # --- 4: the exam and busy blocks in the .ics export -----------
+
+    def test_ics_includes_exam_and_busy_events(self):
+        course_id, exam_id = self._scarce_setup()
+        with app.connect() as conn:
+            conn.execute(
+                "INSERT INTO busy_blocks (block_date, start_time,"
+                " end_time, reason) VALUES (?, '18:00', '20:00',"
+                " 'חברים')",
+                ((date.today() + timedelta(days=1)).isoformat(),))
+        _, _, data = self._request("GET", "/export-plan.ics")
+        exam_day = (date.today() + timedelta(days=10)).strftime("%Y%m%d")
+        self.assertIn(f"DTSTART;VALUE=DATE:{exam_day}", data)
+        self.assertIn("מבחן: Midterm", data)
+        self.assertIn("תפוס: חברים", data)
+
+    def test_per_exam_ics_includes_its_exam_but_not_busy(self):
+        course_id, exam_id = self._scarce_setup()
+        with app.connect() as conn:
+            conn.execute(
+                "INSERT INTO busy_blocks (block_date, start_time,"
+                " end_time, reason) VALUES (?, '18:00', '20:00',"
+                " 'חברים')",
+                ((date.today() + timedelta(days=1)).isoformat(),))
+        _, _, data = self._request(
+            "GET", f"/export-exam.ics?exam_id={exam_id}")
+        exam_day = (date.today() + timedelta(days=10)).strftime("%Y%m%d")
+        self.assertIn(f"DTSTART;VALUE=DATE:{exam_day}", data)
+        self.assertIn("מבחן: Midterm", data)
+        self.assertNotIn("תפוס: חברים", data)
 
 
 if __name__ == "__main__":

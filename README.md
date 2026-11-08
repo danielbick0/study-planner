@@ -28,12 +28,19 @@ stored in SQLite (`planner.db`, created on first run).
   simulations near the exam. Sessions that cannot fit are reported
   honestly, never silently dropped.
 - **Assignments** — hours and number of parts become one continuous
-  block per part, scheduled around exam sessions.
+  block per part, scheduled around exam sessions. Assignments
+  outrank general review sessions: a review that has not been done
+  yet yields its time to homework, and the exam plan is rebuilt so
+  the review moves into whatever free time is left. Assignments are
+  scheduled in due-date order (most urgent first), and there is a
+  quick add-assignment form right on the dashboard.
 - **Today-first dashboard** — what to do now and next, missed
-  sessions, a "needs attention" box, and per-exam countdown and
-  progress.
+  sessions (a session that ended today and was not done is flagged
+  missed the same day), blocked time shown with its reason, a "needs
+  attention" box, and per-exam countdown and progress.
 - **Export** — download the whole plan (or one exam) as an `.ics`
-  file and import it into Google or Apple Calendar.
+  file and import it into Google or Apple Calendar. The export
+  includes the exam itself as an all-day event, and blocked time.
 - **Undo** — marking anything done can be undone; deleting topics
   always asks for confirmation first.
 
@@ -57,7 +64,7 @@ then open `http://<that address>:8000` in the phone's browser.
 python3 -m unittest test_app -v
 ```
 
-192 tests, covering parsing, planning, validation, and every
+205 tests, covering parsing, planning, validation, and every
 route — all passing, zero `<script>` tags in the app.
 
 ## Project structure
